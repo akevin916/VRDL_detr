@@ -6,13 +6,33 @@
 
 ---
 
-## 新增數字資料集
+## 修改說明
 
 | 檔案 | 修改內容 |
 |---|---|
-| `datasets/nycu.py` | 自訂數字 dataset，做輕量化 augmentation |
+| `datasets/nycu.py` | 自訂的數字資料集包含輕量化 augmentation |
 | `datasets/__init__.py` | 新增 `'nycu'` dataset 路由 |
 | `models/detr.py` | `num_classes = 11`（category ID 1～10 對應數字 0～9，index 11 為背景） |
+| `engine.py` | 新增 TensorBoard step/epoch logging、`visualize_val_samples` |
+| `main.py` | 新增 `--exp_name`、自動 output dir、`best.pth`、`metrics_curve.png`、`samples.png`、`params.txt` |
+
+### 類別對應關係
+
+```
+模型輸出 index    意義
+─────────────────────────
+     0           未使用（COCO 格式 category ID 從 1 開始）
+   1 ~ 10        數字 "0" ~ "9"（category_id = 1 ~ 10）
+    11           背景 / no-object
+```
+
+### 初始權重說明
+
+| 模組 | 初始權重 |
+|---|---|
+| Backbone（ResNet-50） | ImageNet 預訓練 |
+| Transformer（Encoder + Decoder） | 隨機初始化 |
+| 分類頭 / Bbox 頭 | 隨機初始化 |
 
 ---
 
@@ -24,7 +44,7 @@
 nvidia-smi   # 查看驅動版本與 CUDA 版本
 ```
 
-| 驅動版本 | 對應安裝指令 |
+| 驅動版本 | 安裝指令 |
 |---|---|
 | CUDA 12.4（驅動 >= 550） | `pip install torch==2.6.0 torchvision==0.21.0 --index-url https://download.pytorch.org/whl/cu124 --force-reinstall` |
 | CUDA 12.1（驅動 >= 530） | `pip install torch==2.6.0 torchvision==0.21.0 --index-url https://download.pytorch.org/whl/cu121 --force-reinstall` |
@@ -32,7 +52,14 @@ nvidia-smi   # 查看驅動版本與 CUDA 版本
 ### 2. 安裝其他依賴
 
 ```bash
-pip install scipy pycocotools
+pip install scipy pycocotools matplotlib tensorboard
+```
+
+### 3. 確認 GPU 可用
+
+```bash
+python3 -c "import torch; print(torch.cuda.is_available()); print(torch.cuda.get_device_name(0))"
+# 應輸出: True  以及  GPU 型號
 ```
 
 ---
@@ -48,95 +75,89 @@ data/nycu-hw2-data/
     test/             # 測試圖片（.png，無標注）
 ```
 
-標注範例：
-
-```json
-"categories": [
-    {"id": 1, "name": "0"},
-    {"id": 2, "name": "1"},
-    ...
-    {"id": 10, "name": "9"}
-]
-```
-
 ---
 
 ## 訓練
 
-### 方案一：從頭訓練
+output_dir 為 `output/MMDD_<exp_name>/`，。
+
+### 基本訓練（Backbone ImageNet pretrained + Transformer 從頭訓練）
 
 ```bash
 python main.py \
   --dataset_file nycu \
   --coco_path data/nycu-hw2-data \
-  --output_dir output/nycu_run1 \
+  --exp_name run1 \
   --epochs 50 \
   --lr_drop 40 \
   --num_queries 20 \
-  --batch_size 16 \
+  --batch_size 32 \
   --num_workers 4 \
   --device cuda
 ```
-
-### 方案二：從 COCO 預訓練 Fine-tune
-
-```bash
-python main.py \
-  --dataset_file nycu \
-  --coco_path data/nycu-hw2-data \
-  --output_dir output/nycu_finetune \
-  --resume https://dl.fbaipublicfiles.com/detr/detr-r50-e632da11.pth \
-  --epochs 50 \
-  --lr_drop 40 \
-  --num_queries 20 \
-  --batch_size 16 \
-  --num_workers 4 \
-  --device cuda
-```
-
-> **注意：** 載入 COCO 預訓練權重時，分類頭（class head）因 `num_classes` 不同會自動跳過，backbone 與 transformer 的權重正常繼承。
 
 ### 主要訓練參數說明
 
 | 參數 | 預設值 | 說明 |
 |---|---|---|
-| `--num_queries` | 20 | 每張圖最多偵測幾個物件，數字圖設 20 已充裕 |
-| `--batch_size` | 32 | RTX 4090 可設 16～32 |
-| `--epochs` | 50 | 訓練總 epoch 數 |
-| `--lr_drop` | 40 | 第幾個 epoch 後將 learning rate 降低 10 倍 |
-| `--lr` | 1e-4 | Transformer 學習率 |
-| `--lr_backbone` | 1e-5 | Backbone 學習率（較小以保留預訓練特徵） |
+| `--exp_name` | `'exp'` | 實驗名稱，影響 output dir 命名 |
+| `--num_queries` | `100` | 每張圖最多偵測幾個物件，數字圖建議設 20 |
+| `--batch_size` | `2` | 依 GPU 記憶體調整，RTX 4090 可設 16～32 |
+| `--epochs` | `300` | 訓練總 epoch 數 |
+| `--lr_drop` | `200` | 第幾個 epoch 後 LR 降低 10 倍 |
+| `--lr` | `1e-4` | Transformer 學習率 |
+| `--lr_backbone` | `1e-5` | Backbone 學習率（較小以保留 ImageNet 特徵） |
 
 ---
 
 ## 評估（Evaluation）
 
-使用驗證集評估訓練好的模型 mAP：
-
 ```bash
 python main.py \
   --dataset_file nycu \
   --coco_path data/nycu-hw2-data \
-  --resume output/nycu_finetune/checkpoint.pth \
+  --resume output/0416_run1/best.pth \
   --eval \
   --batch_size 8 \
   --num_queries 20 \
   --device cuda
 ```
 
-輸出結果包含 COCO 標準指標：AP、AP50、AP75 等。
+輸出包含 COCO 標準指標：mAP、mAP50、mAP75、AR 等。
+
+---
+
+## TensorBoard
+
+```bash
+tensorboard --logdir output
+```
+
+記錄內容：
+
+| 群組 | 指標 |
+|---|---|
+| `train/`（per step） | `loss`、`loss_ce`、`loss_bbox`、`loss_giou`、`class_error`、`grad_norm`、`lr` |
+| `train/`（per epoch） | `epoch_loss`、`epoch_loss_*`、`lr_transformer`、`lr_backbone` |
+| `val/`（per epoch） | `mAP`、`mAP50`、`mAP75`、`mAP_small/medium/large`、`AR_maxDets1/10/{num_queries}` |
 
 ---
 
 ## 輸出檔案
 
-訓練過程中，`--output_dir` 資料夾會產生：
+```
+output/0416_run1/
+├── last.pth             # 每個 epoch 覆蓋，最新一個 epoch 的完整訓練狀態
+├── best.pth             # val mAP 最高時更新的完整訓練狀態
+├── params.txt           # 本次訓練的所有參數
+├── log.txt              # 每個 epoch 的 loss / mAP JSON 紀錄
+├── metrics_curve.png    # 訓練曲線圖（上：loss，下：mAP / mAP50）
+├── samples.png          # 訓練結束後用 best.pth 對 val 做推論的視覺結果
+└── runs/                # TensorBoard log
+    └── events.out.tfevents.*
+```
 
-```
-output/nycu_finetune/
-    checkpoint.pth        # 最後一個 epoch 的權重
-    log.txt               # 每個 epoch 的 loss / mAP 紀錄
-```
+> 可直接用 `--resume` 繼續訓練或做推論。
 
 ---
 

@@ -6,6 +6,9 @@ import random
 import time
 from pathlib import Path
 
+import matplotlib
+matplotlib.use('Agg')
+import matplotlib.pyplot as plt
 import numpy as np
 import torch
 from torch.utils.data import DataLoader, DistributedSampler
@@ -13,8 +16,9 @@ from torch.utils.data import DataLoader, DistributedSampler
 import datasets
 import util.misc as utils
 from datasets import build_dataset, get_coco_api_from_dataset
-from engine import evaluate, train_one_epoch
+from engine import evaluate, train_one_epoch, visualize_val_samples
 from models import build_model
+from torch.utils.tensorboard import SummaryWriter
 
 
 def get_args_parser():
@@ -84,8 +88,12 @@ def get_args_parser():
     parser.add_argument('--coco_panoptic_path', type=str)
     parser.add_argument('--remove_difficult', action='store_true')
 
+    parser.add_argument('--exp_name', default='exp', type=str,
+                        help='experiment name, used for auto output dir: output/MMDD_<exp_name>')
     parser.add_argument('--output_dir', default='',
                         help='path where to save, empty for no saving')
+    parser.add_argument('--tensorboard_dir', default='',
+                        help='TensorBoard log dir, defaults to output_dir/runs if empty')
     parser.add_argument('--device', default='cuda',
                         help='device to use for training / testing')
     parser.add_argument('--seed', default=42, type=int)
@@ -165,16 +173,29 @@ def main(args):
         base_ds = get_coco_api_from_dataset(dataset_val)
 
     if args.frozen_weights is not None:
-        checkpoint = torch.load(args.frozen_weights, map_location='cpu')
+        checkpoint = torch.load(args.frozen_weights, map_location='cpu', weights_only=False)
         model_without_ddp.detr.load_state_dict(checkpoint['model'])
 
     output_dir = Path(args.output_dir)
+
+    # Save training parameters
+    if utils.is_main_process() and args.output_dir:
+        with (output_dir / 'params.txt').open('w') as f:
+            for k, v in sorted(vars(args).items()):
+                f.write(f'{k}: {v}\n')
+
+    # TensorBoard writer (main process only)
+    writer = None
+    if utils.is_main_process() and args.output_dir:
+        tb_dir = Path(args.tensorboard_dir) if args.tensorboard_dir else output_dir / 'runs'
+        writer = SummaryWriter(log_dir=str(tb_dir))
+
     if args.resume:
         if args.resume.startswith('https'):
             checkpoint = torch.hub.load_state_dict_from_url(
                 args.resume, map_location='cpu', check_hash=True)
         else:
-            checkpoint = torch.load(args.resume, map_location='cpu')
+            checkpoint = torch.load(args.resume, map_location='cpu', weights_only=False)
         model_without_ddp.load_state_dict(checkpoint['model'])
         if not args.eval and 'optimizer' in checkpoint and 'lr_scheduler' in checkpoint and 'epoch' in checkpoint:
             optimizer.load_state_dict(checkpoint['optimizer'])
@@ -190,30 +211,59 @@ def main(args):
 
     print("Start training")
     start_time = time.time()
+    global_step = 0
+    best_mAP = 0.0
+    history = {'train_loss': [], 'mAP': [], 'mAP50': []}
     for epoch in range(args.start_epoch, args.epochs):
         if args.distributed:
             sampler_train.set_epoch(epoch)
-        train_stats = train_one_epoch(
+        train_stats, global_step = train_one_epoch(
             model, criterion, data_loader_train, optimizer, device, epoch,
-            args.clip_max_norm)
+            args.clip_max_norm, writer=writer, global_step=global_step)
         lr_scheduler.step()
+
+        if writer is not None:
+            writer.add_scalar('train/epoch_loss',        train_stats['loss'],                       epoch)
+            for k, v in train_stats.items():
+                if k.startswith('loss'):
+                    writer.add_scalar(f'train/epoch_{k}', v,                                       epoch)
+            writer.add_scalar('train/epoch_class_error', train_stats.get('class_error', 0),        epoch)
+            writer.add_scalar('train/lr_transformer',    optimizer.param_groups[0]['lr'],           epoch)
+            writer.add_scalar('train/lr_backbone',       optimizer.param_groups[1]['lr'],           epoch)
+        # Save last checkpoint every epoch
         if args.output_dir:
-            checkpoint_paths = [output_dir / 'checkpoint.pth']
-            # extra checkpoint before LR drop and every 100 epochs
-            if (epoch + 1) % args.lr_drop == 0 or (epoch + 1) % 100 == 0:
-                checkpoint_paths.append(output_dir / f'checkpoint{epoch:04}.pth')
-            for checkpoint_path in checkpoint_paths:
-                utils.save_on_master({
-                    'model': model_without_ddp.state_dict(),
-                    'optimizer': optimizer.state_dict(),
-                    'lr_scheduler': lr_scheduler.state_dict(),
-                    'epoch': epoch,
-                    'args': args,
-                }, checkpoint_path)
+            utils.save_on_master({
+                'model': model_without_ddp.state_dict(),
+                'optimizer': optimizer.state_dict(),
+                'lr_scheduler': lr_scheduler.state_dict(),
+                'epoch': epoch,
+                'args': args,
+            }, output_dir / 'last.pth')
 
         test_stats, coco_evaluator = evaluate(
-            model, criterion, postprocessors, data_loader_val, base_ds, device, args.output_dir
+            model, criterion, postprocessors, data_loader_val, base_ds, device, args.output_dir,
+            writer=writer, epoch=epoch, num_queries=args.num_queries
         )
+
+        # Track metrics history
+        history['train_loss'].append(train_stats['loss'])
+        cur_mAP   = test_stats.get('coco_eval_bbox', [0])[0]
+        cur_mAP50 = test_stats.get('coco_eval_bbox', [0, 0])[1]
+        history['mAP'].append(cur_mAP)
+        history['mAP50'].append(cur_mAP50)
+
+        # Save best checkpoint
+        if args.output_dir and cur_mAP >= best_mAP:
+            best_mAP = cur_mAP
+            utils.save_on_master({
+                'model': model_without_ddp.state_dict(),
+                'optimizer': optimizer.state_dict(),
+                'lr_scheduler': lr_scheduler.state_dict(),
+                'epoch': epoch,
+                'args': args,
+            }, output_dir / 'best.pth')
+            if utils.is_main_process():
+                print(f'  -> New best mAP {best_mAP:.4f}, saved best.pth')
 
         log_stats = {**{f'train_{k}': v for k, v in train_stats.items()},
                      **{f'test_{k}': v for k, v in test_stats.items()},
@@ -224,25 +274,51 @@ def main(args):
             with (output_dir / "log.txt").open("a") as f:
                 f.write(json.dumps(log_stats) + "\n")
 
-            # for evaluation logs
-            if coco_evaluator is not None:
-                (output_dir / 'eval').mkdir(exist_ok=True)
-                if "bbox" in coco_evaluator.coco_eval:
-                    filenames = ['latest.pth']
-                    if epoch % 50 == 0:
-                        filenames.append(f'{epoch:03}.pth')
-                    for name in filenames:
-                        torch.save(coco_evaluator.coco_eval["bbox"].eval,
-                                   output_dir / "eval" / name)
+    if writer is not None:
+        writer.close()
+
+    # Plot and save metrics curve (2 subplots)
+    if utils.is_main_process() and args.output_dir and history['train_loss']:
+        epochs_x = list(range(args.start_epoch, args.start_epoch + len(history['train_loss'])))
+        fig, (ax1, ax2) = plt.subplots(2, 1, figsize=(10, 8))
+        ax1.plot(epochs_x, history['train_loss'], color='steelblue', label='Train Loss')
+        ax1.set_xlabel('Epoch')
+        ax1.set_ylabel('Loss')
+        ax1.set_title('Training Loss')
+        ax1.legend()
+        ax1.grid(True)
+        if history['mAP']:
+            ax2.plot(epochs_x, history['mAP'],   color='salmon',        label='mAP')
+            ax2.plot(epochs_x, history['mAP50'], color='mediumseagreen', label='mAP50')
+            ax2.set_xlabel('Epoch')
+            ax2.set_ylabel('AP')
+            ax2.set_title('Validation mAP')
+            ax2.legend()
+            ax2.grid(True)
+        plt.tight_layout()
+        plt.savefig(str(output_dir / 'metrics_curve.png'), dpi=120, bbox_inches='tight')
+        plt.close()
+        print(f'Saved metrics curve -> {output_dir}/metrics_curve.png')
+
+    # Visualize val samples using best model
+    if utils.is_main_process() and args.output_dir:
+        best_path = output_dir / 'best.pth'
+        if best_path.exists():
+            ckpt = torch.load(str(best_path), map_location='cpu', weights_only=False)
+            model_without_ddp.load_state_dict(ckpt['model'])
+        visualize_val_samples(model, postprocessors, data_loader_val, device, args.output_dir)
 
     total_time = time.time() - start_time
     total_time_str = str(datetime.timedelta(seconds=int(total_time)))
-    print('Training time {}'.format(total_time_str))
+    print('Training time {}'.format(total_t會ime_str))
 
 
 if __name__ == '__main__':
     parser = argparse.ArgumentParser('DETR training and evaluation script', parents=[get_args_parser()])
     args = parser.parse_args()
+    if not args.output_dir:
+        date_str = datetime.datetime.now().strftime('%m%d')
+        args.output_dir = f'output/{date_str}_{args.exp_name}'
     if args.output_dir:
         Path(args.output_dir).mkdir(parents=True, exist_ok=True)
     main(args)
