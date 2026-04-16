@@ -1,267 +1,145 @@
-**DE⫶TR**: End-to-End Object Detection with Transformers
-========
+# DETR — 數字偵測專用版 (NYCU HW2)
 
-[![Support Ukraine](https://img.shields.io/badge/Support-Ukraine-FFD500?style=flat&labelColor=005BBB)](https://opensource.fb.com/support-ukraine)
+本專案基於 Facebook Research 的 [DETR (End-to-End Object Detection with Transformers)](https://github.com/facebookresearch/detr) 修改，針對 **NYCU HW2 數字偵測資料集**進行客製化，支援 10 類數字（0～9）的物件偵測訓練與評估。
 
-PyTorch training code and pretrained models for **DETR** (**DE**tection **TR**ansformer).
-We replace the full complex hand-crafted object detection pipeline with a Transformer, and match Faster R-CNN with a ResNet-50, obtaining **42 AP** on COCO using half the computation power (FLOPs) and the same number of parameters. Inference in 50 lines of PyTorch.
+> 原始論文：[End-to-End Object Detection with Transformers](https://ai.facebook.com/research/publications/end-to-end-object-detection-with-transformers)
 
-![DETR](.github/DETR.png)
+---
 
-**What it is**. Unlike traditional computer vision techniques, DETR approaches object detection as a direct set prediction problem. It consists of a set-based global loss, which forces unique predictions via bipartite matching, and a Transformer encoder-decoder architecture. 
-Given a fixed small set of learned object queries, DETR reasons about the relations of the objects and the global image context to directly output the final set of predictions in parallel. Due to this parallel nature, DETR is very fast and efficient.
+## 新增數字資料集
 
-**About the code**. We believe that object detection should not be more difficult than classification,
-and should not require complex libraries for training and inference.
-DETR is very simple to implement and experiment with, and we provide a
-[standalone Colab Notebook](https://colab.research.google.com/github/facebookresearch/detr/blob/colab/notebooks/detr_demo.ipynb)
-showing how to do inference with DETR in only a few lines of PyTorch code.
-Training code follows this idea - it is not a library,
-but simply a [main.py](main.py) importing model and criterion
-definitions with standard training loops.
+| 檔案 | 修改內容 |
+|---|---|
+| `datasets/nycu.py` | 自訂數字 dataset，做輕量化 augmentation |
+| `datasets/__init__.py` | 新增 `'nycu'` dataset 路由 |
+| `models/detr.py` | `num_classes = 11`（category ID 1～10 對應數字 0～9，index 11 為背景） |
 
-Additionnally, we provide a Detectron2 wrapper in the d2/ folder. See the readme there for more information.
+---
 
-For details see [End-to-End Object Detection with Transformers](https://ai.facebook.com/research/publications/end-to-end-object-detection-with-transformers) by Nicolas Carion, Francisco Massa, Gabriel Synnaeve, Nicolas Usunier, Alexander Kirillov, and Sergey Zagoruyko.
+## 環境安裝
 
-See our [blog post](https://ai.facebook.com/blog/end-to-end-object-detection-with-transformers/) to learn more about end to end object detection with transformers.
-# Model Zoo
-We provide baseline DETR and DETR-DC5 models, and plan to include more in future.
-AP is computed on COCO 2017 val5k, and inference time is over the first 100 val5k COCO images,
-with torchscript transformer.
+### 1. 確認 CUDA 版本對應
 
-<table>
-  <thead>
-    <tr style="text-align: right;">
-      <th></th>
-      <th>name</th>
-      <th>backbone</th>
-      <th>schedule</th>
-      <th>inf_time</th>
-      <th>box AP</th>
-      <th>url</th>
-      <th>size</th>
-    </tr>
-  </thead>
-  <tbody>
-    <tr>
-      <th>0</th>
-      <td>DETR</td>
-      <td>R50</td>
-      <td>500</td>
-      <td>0.036</td>
-      <td>42.0</td>
-      <td><a href="https://dl.fbaipublicfiles.com/detr/detr-r50-e632da11.pth">model</a>&nbsp;|&nbsp;<a href="https://dl.fbaipublicfiles.com/detr/logs/detr-r50_log.txt">logs</a></td>
-      <td>159Mb</td>
-    </tr>
-    <tr>
-      <th>1</th>
-      <td>DETR-DC5</td>
-      <td>R50</td>
-      <td>500</td>
-      <td>0.083</td>
-      <td>43.3</td>
-      <td><a href="https://dl.fbaipublicfiles.com/detr/detr-r50-dc5-f0fb7ef5.pth">model</a>&nbsp;|&nbsp;<a href="https://dl.fbaipublicfiles.com/detr/logs/detr-r50-dc5_log.txt">logs</a></td>
-      <td>159Mb</td>
-    </tr>
-    <tr>
-      <th>2</th>
-      <td>DETR</td>
-      <td>R101</td>
-      <td>500</td>
-      <td>0.050</td>
-      <td>43.5</td>
-      <td><a href="https://dl.fbaipublicfiles.com/detr/detr-r101-2c7b67e5.pth">model</a>&nbsp;|&nbsp;<a href="https://dl.fbaipublicfiles.com/detr/logs/detr-r101_log.txt">logs</a></td>
-      <td>232Mb</td>
-    </tr>
-    <tr>
-      <th>3</th>
-      <td>DETR-DC5</td>
-      <td>R101</td>
-      <td>500</td>
-      <td>0.097</td>
-      <td>44.9</td>
-      <td><a href="https://dl.fbaipublicfiles.com/detr/detr-r101-dc5-a2e86def.pth">model</a>&nbsp;|&nbsp;<a href="https://dl.fbaipublicfiles.com/detr/logs/detr-r101-dc5_log.txt">logs</a></td>
-      <td>232Mb</td>
-    </tr>
-  </tbody>
-</table>
-
-COCO val5k evaluation results can be found in this [gist](https://gist.github.com/szagoruyko/9c9ebb8455610958f7deaa27845d7918).
-
-The models are also available via torch hub,
-to load DETR R50 with pretrained weights simply do:
-```python
-model = torch.hub.load('facebookresearch/detr:main', 'detr_resnet50', pretrained=True)
+```bash
+nvidia-smi   # 查看驅動版本與 CUDA 版本
 ```
 
+| 驅動版本 | 對應安裝指令 |
+|---|---|
+| CUDA 12.4（驅動 >= 550） | `pip install torch==2.6.0 torchvision==0.21.0 --index-url https://download.pytorch.org/whl/cu124 --force-reinstall` |
+| CUDA 12.1（驅動 >= 530） | `pip install torch==2.6.0 torchvision==0.21.0 --index-url https://download.pytorch.org/whl/cu121 --force-reinstall` |
 
-COCO panoptic val5k models:
-<table>
-  <thead>
-    <tr style="text-align: right;">
-      <th></th>
-      <th>name</th>
-      <th>backbone</th>
-      <th>box AP</th>
-      <th>segm AP</th>
-      <th>PQ</th>
-      <th>url</th>
-      <th>size</th>
-    </tr>
-  </thead>
-  <tbody>
-    <tr>
-      <th>0</th>
-      <td>DETR</td>
-      <td>R50</td>
-      <td>38.8</td>
-      <td>31.1</td>
-      <td>43.4</td>
-      <td><a href="https://dl.fbaipublicfiles.com/detr/detr-r50-panoptic-00ce5173.pth">download</a></td>
-      <td>165Mb</td>
-    </tr>
-    <tr>
-      <th>1</th>
-      <td>DETR-DC5</td>
-      <td>R50</td>
-      <td>40.2</td>
-      <td>31.9</td>
-      <td>44.6</td>
-      <td><a href="https://dl.fbaipublicfiles.com/detr/detr-r50-dc5-panoptic-da08f1b1.pth">download</a></td>
-      <td>165Mb</td>
-    </tr>
-    <tr>
-      <th>2</th>
-      <td>DETR</td>
-      <td>R101</td>
-      <td>40.1</td>
-      <td>33</td>
-      <td>45.1</td>
-      <td><a href="https://dl.fbaipublicfiles.com/detr/detr-r101-panoptic-40021d53.pth">download</a></td>
-      <td>237Mb</td>
-    </tr>
-  </tbody>
-</table>
+### 2. 安裝其他依賴
 
-Checkout our [panoptic colab](https://colab.research.google.com/github/facebookresearch/detr/blob/colab/notebooks/DETR_panoptic.ipynb)
-to see how to use and visualize DETR's panoptic segmentation prediction.
-
-# Notebooks
-
-We provide a few notebooks in colab to help you get a grasp on DETR:
-* [DETR's hands on Colab Notebook](https://colab.research.google.com/github/facebookresearch/detr/blob/colab/notebooks/detr_attention.ipynb): Shows how to load a model from hub, generate predictions, then visualize the attention of the model (similar to the figures of the paper)
-* [Standalone Colab Notebook](https://colab.research.google.com/github/facebookresearch/detr/blob/colab/notebooks/detr_demo.ipynb): In this notebook, we demonstrate how to implement a simplified version of DETR from the grounds up in 50 lines of Python, then visualize the predictions. It is a good starting point if you want to gain better understanding the architecture and poke around before diving in the codebase.
-* [Panoptic Colab Notebook](https://colab.research.google.com/github/facebookresearch/detr/blob/colab/notebooks/DETR_panoptic.ipynb): Demonstrates how to use DETR for panoptic segmentation and plot the predictions.
-
-
-# Usage - Object detection
-There are no extra compiled components in DETR and package dependencies are minimal,
-so the code is very simple to use. We provide instructions how to install dependencies via conda.
-First, clone the repository locally:
-```
-git clone https://github.com/facebookresearch/detr.git
-```
-Then, install PyTorch 1.5+ and torchvision 0.6+:
-```
-conda install -c pytorch pytorch torchvision
-```
-Install pycocotools (for evaluation on COCO) and scipy (for training):
-```
-conda install cython scipy
-pip install -U 'git+https://github.com/cocodataset/cocoapi.git#subdirectory=PythonAPI'
-```
-That's it, should be good to train and evaluate detection models.
-
-(optional) to work with panoptic install panopticapi:
-```
-pip install git+https://github.com/cocodataset/panopticapi.git
+```bash
+pip install scipy pycocotools
 ```
 
-## Data preparation
+---
 
-Download and extract COCO 2017 train and val images with annotations from
-[http://cocodataset.org](http://cocodataset.org/#download).
-We expect the directory structure to be the following:
-```
-path/to/coco/
-  annotations/  # annotation json files
-  train2017/    # train images
-  val2017/      # val images
-```
+## 資料集結構
 
-## Training
-To train baseline DETR on a single node with 8 gpus for 300 epochs run:
 ```
-python -m torch.distributed.launch --nproc_per_node=8 --use_env main.py --coco_path /path/to/coco 
-```
-A single epoch takes 28 minutes, so 300 epoch training
-takes around 6 days on a single machine with 8 V100 cards.
-To ease reproduction of our results we provide
-[results and training logs](https://gist.github.com/szagoruyko/b4c3b2c3627294fc369b899987385a3f)
-for 150 epoch schedule (3 days on a single machine), achieving 39.5/60.3 AP/AP50.
-
-We train DETR with AdamW setting learning rate in the transformer to 1e-4 and 1e-5 in the backbone.
-Horizontal flips, scales and crops are used for augmentation.
-Images are rescaled to have min size 800 and max size 1333.
-The transformer is trained with dropout of 0.1, and the whole model is trained with grad clip of 0.1.
-
-
-## Evaluation
-To evaluate DETR R50 on COCO val5k with a single GPU run:
-```
-python main.py --batch_size 2 --no_aux_loss --eval --resume https://dl.fbaipublicfiles.com/detr/detr-r50-e632da11.pth --coco_path /path/to/coco
-```
-We provide results for all DETR detection models in this
-[gist](https://gist.github.com/szagoruyko/9c9ebb8455610958f7deaa27845d7918).
-Note that numbers vary depending on batch size (number of images) per GPU.
-Non-DC5 models were trained with batch size 2, and DC5 with 1,
-so DC5 models show a significant drop in AP if evaluated with more
-than 1 image per GPU.
-
-## Multinode training
-Distributed training is available via Slurm and [submitit](https://github.com/facebookincubator/submitit):
-```
-pip install submitit
-```
-Train baseline DETR-6-6 model on 4 nodes for 300 epochs:
-```
-python run_with_submitit.py --timeout 3000 --coco_path /path/to/coco
+data/nycu-hw2-data/
+    train.json        # 訓練集標注（COCO 格式）
+    valid.json        # 驗證集標注（COCO 格式）
+    train/            # 訓練圖片（.png）
+    valid/            # 驗證圖片（.png）
+    test/             # 測試圖片（.png，無標注）
 ```
 
-# Usage - Segmentation
+標注範例：
 
-We show that it is relatively straightforward to extend DETR to predict segmentation masks. We mainly demonstrate strong panoptic segmentation results.
-
-## Data preparation
-
-For panoptic segmentation, you need the panoptic annotations additionally to the coco dataset (see above for the coco dataset). You need to download and extract the [annotations](http://images.cocodataset.org/annotations/panoptic_annotations_trainval2017.zip).
-We expect the directory structure to be the following:
-```
-path/to/coco_panoptic/
-  annotations/  # annotation json files
-  panoptic_train2017/    # train panoptic annotations
-  panoptic_val2017/      # val panoptic annotations
+```json
+"categories": [
+    {"id": 1, "name": "0"},
+    {"id": 2, "name": "1"},
+    ...
+    {"id": 10, "name": "9"}
+]
 ```
 
-## Training
+---
 
-We recommend training segmentation in two stages: first train DETR to detect all the boxes, and then train the segmentation head.
-For panoptic segmentation, DETR must learn to detect boxes for both stuff and things classes. You can train it on a single node with 8 gpus for 300 epochs with:
-```
-python -m torch.distributed.launch --nproc_per_node=8 --use_env main.py --coco_path /path/to/coco  --coco_panoptic_path /path/to/coco_panoptic --dataset_file coco_panoptic --output_dir /output/path/box_model
-```
-For instance segmentation, you can simply train a normal box model (or used a pre-trained one we provide).
+## 訓練
 
-Once you have a box model checkpoint, you need to freeze it, and train the segmentation head in isolation.
-For panoptic segmentation you can train on a single node with 8 gpus for 25 epochs:
-```
-python -m torch.distributed.launch --nproc_per_node=8 --use_env main.py --masks --epochs 25 --lr_drop 15 --coco_path /path/to/coco  --coco_panoptic_path /path/to/coco_panoptic  --dataset_file coco_panoptic --frozen_weights /output/path/box_model/checkpoint.pth --output_dir /output/path/segm_model
-```
-For instance segmentation only, simply remove the `dataset_file` and `coco_panoptic_path` arguments from the above command line.
+### 方案一：從頭訓練
 
-# License
-DETR is released under the Apache 2.0 license. Please see the [LICENSE](LICENSE) file for more information.
+```bash
+python main.py \
+  --dataset_file nycu \
+  --coco_path data/nycu-hw2-data \
+  --output_dir output/nycu_run1 \
+  --epochs 50 \
+  --lr_drop 40 \
+  --num_queries 20 \
+  --batch_size 16 \
+  --num_workers 4 \
+  --device cuda
+```
 
-# Contributing
-We actively welcome your pull requests! Please see [CONTRIBUTING.md](.github/CONTRIBUTING.md) and [CODE_OF_CONDUCT.md](.github/CODE_OF_CONDUCT.md) for more info.
+### 方案二：從 COCO 預訓練 Fine-tune
+
+```bash
+python main.py \
+  --dataset_file nycu \
+  --coco_path data/nycu-hw2-data \
+  --output_dir output/nycu_finetune \
+  --resume https://dl.fbaipublicfiles.com/detr/detr-r50-e632da11.pth \
+  --epochs 50 \
+  --lr_drop 40 \
+  --num_queries 20 \
+  --batch_size 16 \
+  --num_workers 4 \
+  --device cuda
+```
+
+> **注意：** 載入 COCO 預訓練權重時，分類頭（class head）因 `num_classes` 不同會自動跳過，backbone 與 transformer 的權重正常繼承。
+
+### 主要訓練參數說明
+
+| 參數 | 預設值 | 說明 |
+|---|---|---|
+| `--num_queries` | 20 | 每張圖最多偵測幾個物件，數字圖設 20 已充裕 |
+| `--batch_size` | 32 | RTX 4090 可設 16～32 |
+| `--epochs` | 50 | 訓練總 epoch 數 |
+| `--lr_drop` | 40 | 第幾個 epoch 後將 learning rate 降低 10 倍 |
+| `--lr` | 1e-4 | Transformer 學習率 |
+| `--lr_backbone` | 1e-5 | Backbone 學習率（較小以保留預訓練特徵） |
+
+---
+
+## 評估（Evaluation）
+
+使用驗證集評估訓練好的模型 mAP：
+
+```bash
+python main.py \
+  --dataset_file nycu \
+  --coco_path data/nycu-hw2-data \
+  --resume output/nycu_finetune/checkpoint.pth \
+  --eval \
+  --batch_size 8 \
+  --num_queries 20 \
+  --device cuda
+```
+
+輸出結果包含 COCO 標準指標：AP、AP50、AP75 等。
+
+---
+
+## 輸出檔案
+
+訓練過程中，`--output_dir` 資料夾會產生：
+
+```
+output/nycu_finetune/
+    checkpoint.pth        # 最後一個 epoch 的權重
+    log.txt               # 每個 epoch 的 loss / mAP 紀錄
+```
+
+---
+
+## 授權
+
+本專案繼承原始 DETR 的 Apache 2.0 授權，詳見 [LICENSE](LICENSE)。
