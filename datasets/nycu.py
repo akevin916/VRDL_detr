@@ -1,8 +1,18 @@
 # Custom dataset for NYCU HW2 digit detection (COCO format, 10 classes: digits 0-9)
 from pathlib import Path
 
+import torchvision.transforms as TTV
 import datasets.transforms as T
+
 from .coco import CocoDetection
+
+class ColorJitterTransform:
+
+    def __init__(self):
+        self.jitter = TTV.ColorJitter(brightness=0.4, contrast=0.4, saturation=0.4, hue=0.1)
+
+    def __call__(self, img, target):
+        return self.jitter(img), target
 
 
 def make_nycu_transforms(image_set):
@@ -14,13 +24,14 @@ def make_nycu_transforms(image_set):
     if image_set == 'train':
         return T.Compose([
             T.RandomHorizontalFlip(),
-            T.RandomResize([480, 512, 544, 576, 608], max_size=800),
+            ColorJitterTransform(),
+            T.RandomResize([480, 512, 544, 576, 608], max_size=1333),
             normalize,
         ])
 
     if image_set == 'val':
         return T.Compose([
-            T.RandomResize([480], max_size=800),
+            T.RandomResize([480], max_size=1333),
             normalize,
         ])
 
