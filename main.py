@@ -223,13 +223,8 @@ def main(args):
         lr_scheduler.step()
 
         if writer is not None:
-            writer.add_scalar('train/epoch_loss',        train_stats['loss'],                       epoch)
-            for k, v in train_stats.items():
-                if k.startswith('loss'):
-                    writer.add_scalar(f'train/epoch_{k}', v,                                       epoch)
-            writer.add_scalar('train/epoch_class_error', train_stats.get('class_error', 0),        epoch)
-            writer.add_scalar('train/lr_transformer',    optimizer.param_groups[0]['lr'],           epoch)
-            writer.add_scalar('train/lr_backbone',       optimizer.param_groups[1]['lr'],           epoch)
+            writer.add_scalar('train/lr_transformer', optimizer.param_groups[0]['lr'], epoch)
+            writer.add_scalar('train/lr_backbone',    optimizer.param_groups[1]['lr'], epoch)
         # Save last checkpoint every epoch
         if args.output_dir:
             utils.save_on_master({
@@ -264,6 +259,8 @@ def main(args):
             }, output_dir / 'best.pth')
             if utils.is_main_process():
                 print(f'  -> New best mAP {best_mAP:.4f}, saved best.pth')
+                visualize_val_samples(model, postprocessors, data_loader_val, device,
+                                      args.output_dir, num_images=8, score_thresh=0.7)
 
         log_stats = {**{f'train_{k}': v for k, v in train_stats.items()},
                      **{f'test_{k}': v for k, v in test_stats.items()},
