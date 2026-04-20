@@ -10,3 +10,4 @@ onnx
 onnxruntime
 tensorboard
 matplotlib
+tqdm
