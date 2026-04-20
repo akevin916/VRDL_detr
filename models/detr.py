@@ -20,7 +20,8 @@ from .transformer import build_transformer
 
 class DETR(nn.Module):
     """ This is the DETR module that performs object detection """
-    def __init__(self, backbone, transformer, num_classes, num_queries, aux_loss=False):
+    def __init__(self, backbone, transformer, num_classes, num_queries, aux_loss=False,
+                 use_dab=False):
         """ Initializes the model.
         Parameters:
             backbone: torch module of the backbone to be used. See backbone.py
@@ -29,6 +30,7 @@ class DETR(nn.Module):
             num_queries: number of object queries, ie detection slot. This is the maximal number of objects
                          DETR can detect in a single image. For COCO, we recommend 100 queries.
             aux_loss: True if auxiliary decoding losses (loss at each decoder layer) are to be used.
+            use_dab: True to use DAB-DETR (query_anchor + query_content + iterative refinement).
         """
         super().__init__()
         self.num_queries = num_queries
@@ -36,7 +38,16 @@ class DETR(nn.Module):
         hidden_dim = transformer.d_model
         self.class_embed = nn.Linear(hidden_dim, num_classes + 1)
         self.bbox_embed = MLP(hidden_dim, hidden_dim, 4, 3)
-        self.query_embed = nn.Embedding(num_queries, hidden_dim)
+        self.use_dab = use_dab
+        if use_dab:
+            # DAB-DETR: 分離位置與內容 embedding
+            self.query_anchor  = nn.Embedding(num_queries, 4)          # pre-sigmoid anchor
+            self.query_content = nn.Embedding(num_queries, hidden_dim)  # content prior
+            # 把 bbox_embed 暴露給 decoder 做迭代 refinement
+            self.transformer.decoder.bbox_embed = self.bbox_embed
+        else:
+            # 原始 DETR: 單一 query embedding
+            self.query_embed = nn.Embedding(num_queries, hidden_dim)
         self.input_proj = nn.Conv2d(backbone.num_channels, hidden_dim, kernel_size=1)
         self.backbone = backbone
         self.aux_loss = aux_loss
@@ -62,7 +73,17 @@ class DETR(nn.Module):
 
         src, mask = features[-1].decompose()
         assert mask is not None
-        hs = self.transformer(self.input_proj(src), mask, self.query_embed.weight, pos[-1])[0]
+        if self.use_dab:
+            hs = self.transformer(
+                self.input_proj(src), mask,
+                self.query_anchor.weight,   # (num_q, 4)
+                pos[-1],
+                self.query_content.weight,  # (num_q, hidden_dim)
+            )[0]
+        else:
+            hs = self.transformer(
+                self.input_proj(src), mask, self.query_embed.weight, pos[-1]
+            )[0]
 
         outputs_class = self.class_embed(hs)
         outputs_coord = self.bbox_embed(hs).sigmoid()
@@ -332,6 +353,7 @@ def build(args):
         num_classes=num_classes,
         num_queries=args.num_queries,
         aux_loss=args.aux_loss,
+        use_dab=getattr(args, 'use_dab', False),
     )
     if args.masks:
         model = DETRsegm(model, freeze_detr=(args.frozen_weights is not None))

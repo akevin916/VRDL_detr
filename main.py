@@ -40,6 +40,8 @@ def get_args_parser():
                         help="Name of the convolutional backbone to use")
     parser.add_argument('--dilation', action='store_true',
                         help="If true, we replace stride with dilation in the last convolutional block (DC5)")
+    parser.add_argument('--use_dab', action='store_true',
+                        help="使用 DAB-DETR 架構（query_anchor+query_content+動態 sine 位置查詢+迭代 anchor refinement）")
     parser.add_argument('--position_embedding', default='sine', type=str, choices=('sine', 'learned'),
                         help="Type of positional embedding to use on top of the image features")
 
@@ -219,7 +221,8 @@ def main(args):
             sampler_train.set_epoch(epoch)
         train_stats, global_step = train_one_epoch(
             model, criterion, data_loader_train, optimizer, device, epoch,
-            args.clip_max_norm, writer=writer, global_step=global_step)
+            args.clip_max_norm, writer=writer, global_step=global_step,
+            steps_per_epoch=len(data_loader_train))
         lr_scheduler.step()
 
         if writer is not None:
@@ -307,7 +310,7 @@ def main(args):
 
     total_time = time.time() - start_time
     total_time_str = str(datetime.timedelta(seconds=int(total_time)))
-    print('Training time {}'.format(total_t會ime_str))
+    print('Training time {}'.format(total_time_str))
 
 
 if __name__ == '__main__':

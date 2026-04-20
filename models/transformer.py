@@ -6,8 +6,10 @@ Copy-paste from torch.nn.Transformer with modifications:
     * positional encodings are passed in MHattention
     * extra LN at the end of encoder is removed
     * decoder returns a stack of activations from all decoding layers
+    * DAB-DETR: anchor boxes as positional queries with dynamic sine embedding
 """
 import copy
+import math
 from typing import Optional, List
 
 import torch
@@ -15,12 +17,42 @@ import torch.nn.functional as F
 from torch import nn, Tensor
 
 
+# --------------------------------------------------------------------------- #
+# DAB-DETR helpers
+# --------------------------------------------------------------------------- #
+def inverse_sigmoid(x, eps=1e-5):
+    """Inverse sigmoid (logit)，用於 DAB-DETR 迭代 anchor refinement。"""
+    x = x.clamp(min=0, max=1)
+    return torch.log(x.clamp(min=eps) / (1 - x).clamp(min=eps))
+
+
+def gen_sineembed_for_position(pos_tensor, d_model=256):
+    """從 4D anchor box (cx, cy, w, h) 生成動態 sine 位置 embedding。
+
+    pos_tensor : (N, B, 4) — anchor boxes in [0, 1]
+    returns    : (N, B, d_model)
+    """
+    nf = d_model // 4
+    scale = 2 * math.pi
+    dim_t = torch.arange(nf, dtype=torch.float32, device=pos_tensor.device)
+    dim_t = 10000 ** (2 * (dim_t // 2) / nf)
+
+    def _sincos(val):
+        v = val.unsqueeze(-1) * scale / dim_t
+        return torch.stack([v[..., 0::2].sin(), v[..., 1::2].cos()], dim=-1).flatten(-2)
+
+    cy = _sincos(pos_tensor[..., 1])
+    cx = _sincos(pos_tensor[..., 0])
+    h  = _sincos(pos_tensor[..., 3])
+    w  = _sincos(pos_tensor[..., 2])
+    return torch.cat([cy, cx, h, w], dim=-1)
+
 class Transformer(nn.Module):
 
     def __init__(self, d_model=512, nhead=8, num_encoder_layers=6,
                  num_decoder_layers=6, dim_feedforward=2048, dropout=0.1,
                  activation="relu", normalize_before=False,
-                 return_intermediate_dec=False):
+                 return_intermediate_dec=False, dab=False):
         super().__init__()
 
         encoder_layer = TransformerEncoderLayer(d_model, nhead, dim_feedforward,
@@ -32,30 +64,50 @@ class Transformer(nn.Module):
                                                 dropout, activation, normalize_before)
         decoder_norm = nn.LayerNorm(d_model)
         self.decoder = TransformerDecoder(decoder_layer, num_decoder_layers, decoder_norm,
-                                          return_intermediate=return_intermediate_dec)
+                                          return_intermediate=return_intermediate_dec,
+                                          d_model=d_model)
 
         self._reset_parameters()
 
         self.d_model = d_model
         self.nhead = nhead
+        self.dab = dab
 
     def _reset_parameters(self):
         for p in self.parameters():
             if p.dim() > 1:
                 nn.init.xavier_uniform_(p)
 
-    def forward(self, src, mask, query_embed, pos_embed):
-        # flatten NxCxHxW to HWxNxC
-        bs, c, h, w = src.shape
-        src = src.flatten(2).permute(2, 0, 1)
-        pos_embed = pos_embed.flatten(2).permute(2, 0, 1)
-        query_embed = query_embed.unsqueeze(1).repeat(1, bs, 1)
-        mask = mask.flatten(1)
+    def forward(self, src, mask, query_embed_or_anchor, pos_embed, query_content=None):
+        """共用入口。
 
-        tgt = torch.zeros_like(query_embed)
+        原始 DETR (dab=False):
+            query_embed_or_anchor : (num_q, d_model) — 學習的 query embedding
+        DAB-DETR (dab=True):
+            query_embed_or_anchor : (num_q, 4)       — pre-sigmoid anchor (cx,cy,w,h)
+            query_content         : (num_q, d_model) — 學習的 content embedding
+        """
+        bs, c, h, w = src.shape
+        src      = src.flatten(2).permute(2, 0, 1)
+        pos_embed = pos_embed.flatten(2).permute(2, 0, 1)
+        mask     = mask.flatten(1)
+
         memory = self.encoder(src, src_key_padding_mask=mask, pos=pos_embed)
-        hs = self.decoder(tgt, memory, memory_key_padding_mask=mask,
-                          pos=pos_embed, query_pos=query_embed)
+
+        if self.dab:
+            num_q = query_embed_or_anchor.shape[0]
+            tgt = (query_content.unsqueeze(1).repeat(1, bs, 1)
+                   if query_content is not None
+                   else torch.zeros(num_q, bs, self.d_model, device=src.device))
+            refpoints = query_embed_or_anchor.sigmoid().unsqueeze(1).repeat(1, bs, 1)
+            hs = self.decoder(tgt, memory, memory_key_padding_mask=mask,
+                              pos=pos_embed, refpoints_sigmoid=refpoints)
+        else:
+            query_embed = query_embed_or_anchor.unsqueeze(1).repeat(1, bs, 1)
+            tgt = torch.zeros_like(query_embed)
+            hs = self.decoder(tgt, memory, memory_key_padding_mask=mask,
+                              pos=pos_embed, query_pos=query_embed)
+
         return hs.transpose(1, 2), memory.permute(1, 2, 0).view(bs, c, h, w)
 
 
@@ -85,12 +137,15 @@ class TransformerEncoder(nn.Module):
 
 class TransformerDecoder(nn.Module):
 
-    def __init__(self, decoder_layer, num_layers, norm=None, return_intermediate=False):
+    def __init__(self, decoder_layer, num_layers, norm=None, return_intermediate=False,
+                 d_model=None):
         super().__init__()
         self.layers = _get_clones(decoder_layer, num_layers)
         self.num_layers = num_layers
         self.norm = norm
         self.return_intermediate = return_intermediate
+        self.d_model = d_model   # 只有 dab=True 時需要（用於 gen_sineembed）
+        self.bbox_embed = None   # 由 DETR 設定（dab=True 時啟用迭代 refinement）
 
     def forward(self, tgt, memory,
                 tgt_mask: Optional[Tensor] = None,
@@ -98,12 +153,17 @@ class TransformerDecoder(nn.Module):
                 tgt_key_padding_mask: Optional[Tensor] = None,
                 memory_key_padding_mask: Optional[Tensor] = None,
                 pos: Optional[Tensor] = None,
-                query_pos: Optional[Tensor] = None):
+                query_pos: Optional[Tensor] = None,
+                refpoints_sigmoid: Optional[Tensor] = None):
+        """支援原始 DETR (query_pos) 與 DAB-DETR (refpoints_sigmoid) 兩種路徑。"""
         output = tgt
-
         intermediate = []
 
         for layer in self.layers:
+            if refpoints_sigmoid is not None:
+                # DAB-DETR：每層動態產生 sine positional query
+                query_pos = gen_sineembed_for_position(refpoints_sigmoid, self.d_model)
+
             output = layer(output, memory, tgt_mask=tgt_mask,
                            memory_mask=memory_mask,
                            tgt_key_padding_mask=tgt_key_padding_mask,
@@ -111,6 +171,11 @@ class TransformerDecoder(nn.Module):
                            pos=pos, query_pos=query_pos)
             if self.return_intermediate:
                 intermediate.append(self.norm(output))
+
+            if refpoints_sigmoid is not None and self.bbox_embed is not None:
+                # 迭代 anchor refinement
+                delta = self.bbox_embed(output)
+                refpoints_sigmoid = (inverse_sigmoid(refpoints_sigmoid) + delta).sigmoid()
 
         if self.norm is not None:
             output = self.norm(output)
@@ -283,6 +348,7 @@ def build_transformer(args):
         num_decoder_layers=args.dec_layers,
         normalize_before=args.pre_norm,
         return_intermediate_dec=True,
+        dab=getattr(args, 'use_dab', False),
     )
 
 

@@ -87,12 +87,28 @@ output_dir 為 `output/MMDD_<exp_name>/`，。
 python main.py \
   --dataset_file nycu \
   --coco_path data/nycu-hw2-data \
-  --exp_name run1 \
+  --exp_name baseline50ep \
   --epochs 50 \
   --lr_drop 40 \
   --num_queries 20 \
   --batch_size 32 \
-  --num_workers 4 \
+  --num_workers 0 \
+  --device cuda
+```
+
+### DC5
+
+```bash
+python main.py \
+  --dataset_file nycu \
+  --coco_path data/nycu-hw2-data \
+  --exp_name dc5 \
+  --dilation \
+  --epochs 50 \
+  --lr_drop 40 \
+  --num_queries 20 \
+  --batch_size 32 \
+  --num_workers 0 \
   --device cuda
 ```
 

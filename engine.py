@@ -17,7 +17,7 @@ from datasets.panoptic_eval import PanopticEvaluator
 def train_one_epoch(model: torch.nn.Module, criterion: torch.nn.Module,
                     data_loader: Iterable, optimizer: torch.optim.Optimizer,
                     device: torch.device, epoch: int, max_norm: float = 0,
-                    writer=None, global_step: int = 0):
+                    writer=None, global_step: int = 0, steps_per_epoch: int = 0):
     model.train()
     criterion.train()
     metric_logger = utils.MetricLogger(delimiter="  ")
@@ -25,6 +25,9 @@ def train_one_epoch(model: torch.nn.Module, criterion: torch.nn.Module,
     metric_logger.add_meter('class_error', utils.SmoothedValue(window_size=1, fmt='{value:.2f}'))
     header = 'Epoch: [{}]'.format(epoch)
     print_freq = 10
+    # steps_per_epoch=0 → fallback to global_step (backward compat)
+    _steps = steps_per_epoch if steps_per_epoch > 0 else None
+    _step_in_epoch = 0
 
     for samples, targets in metric_logger.log_every(data_loader, print_freq, header):
         samples = samples.to(device)
@@ -63,15 +66,22 @@ def train_one_epoch(model: torch.nn.Module, criterion: torch.nn.Module,
         metric_logger.update(lr=optimizer.param_groups[0]["lr"])
 
         if writer is not None and utils.is_main_process():
-            writer.add_scalar('train/loss',        loss_value,                                       global_step)
+            # x 軸用「小數 epoch」：epoch 1.5 = 第 2 個 epoch 的中點
+            # 這樣不同 batch_size 的實驗在 TensorBoard 上 x 軸對齊
+            if _steps is not None:
+                tb_x = epoch + _step_in_epoch / _steps
+            else:
+                tb_x = global_step  # fallback：沒傳 steps_per_epoch 時維持舊行為
+            writer.add_scalar('train/loss',        loss_value,                                      tb_x)
             for k, v in loss_dict_reduced_scaled.items():
                 # 只記錄主要 loss，跳過 auxiliary decoder layers (_0 ~ _4)
                 if not any(k.endswith(f'_{i}') for i in range(5)):
-                    writer.add_scalar(f'train/{k}', v.item(), global_step)
-            writer.add_scalar('train/class_error', loss_dict_reduced['class_error'].item(),          global_step)
-            writer.add_scalar('train/grad_norm',   grad_norm.item(),                                 global_step)
-            writer.add_scalar('train/lr',          optimizer.param_groups[0]["lr"],                 global_step)
+                    writer.add_scalar(f'train/{k}', v.item(), tb_x)
+            writer.add_scalar('train/class_error', loss_dict_reduced['class_error'].item(),         tb_x)
+            writer.add_scalar('train/grad_norm',   grad_norm.item(),                                tb_x)
+            writer.add_scalar('train/lr',          optimizer.param_groups[0]["lr"],                tb_x)
         global_step += 1
+        _step_in_epoch += 1
 
     # gather the stats from all processes
     metric_logger.synchronize_between_processes()
