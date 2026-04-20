@@ -12,6 +12,7 @@ import torch
 import util.misc as utils
 from datasets.coco_eval import CocoEvaluator
 from datasets.panoptic_eval import PanopticEvaluator
+from models.cdn import compute_cdn_loss
 
 
 def train_one_epoch(model: torch.nn.Module, criterion: torch.nn.Module,
@@ -33,8 +34,22 @@ def train_one_epoch(model: torch.nn.Module, criterion: torch.nn.Module,
         samples = samples.to(device)
         targets = [{k: v.to(device) for k, v in t.items()} for t in targets]
 
-        outputs = model(samples)
+        outputs = model(samples, targets)
         loss_dict = criterion(outputs, targets)
+
+        # CDN 去噪損失（DINO 訓練專用，直接 GT 分配，不需 Hungarian）
+        if 'dn_meta' in outputs:
+            _m = outputs['dn_meta']
+            dn_losses = compute_cdn_loss(
+                outputs['dn_outputs'], targets,
+                num_classes=criterion.num_classes,
+                eos_coef=criterion.eos_coef,
+                cdn_meta=_m,
+                bbox_loss_coef=5.0,
+                giou_loss_coef=2.0,
+            )
+            loss_dict.update(dn_losses)
+
         weight_dict = criterion.weight_dict
         losses = sum(loss_dict[k] * weight_dict[k] for k in loss_dict.keys() if k in weight_dict)
 

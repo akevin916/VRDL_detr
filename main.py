@@ -42,6 +42,15 @@ def get_args_parser():
                         help="If true, we replace stride with dilation in the last convolutional block (DC5)")
     parser.add_argument('--use_dab', action='store_true',
                         help="使用 DAB-DETR 架構（query_anchor+query_content+動態 sine 位置查詢+迭代 anchor refinement）")
+    # DINO 相關參數（--use_dino 自動包含 --use_dab 的所有功能）
+    parser.add_argument('--use_dino', action='store_true',
+                        help="使用 DINO 架構：CDN 去噪訓練 + Mixed Query Selection + Look Forward Twice")
+    parser.add_argument('--cdn_groups', default=1, type=int,
+                        help="CDN 去噪組數（每組含正/負樣本各一份，更多組 = 更強監督信號）")
+    parser.add_argument('--cdn_label_noise', default=0.5, type=float,
+                        help="CDN 正樣本標籤隨機翻轉比例（0 = 不翻轉）")
+    parser.add_argument('--cdn_box_noise', default=1.0, type=float,
+                        help="CDN box 噪聲尺度（正樣本 < scale/2，負樣本 >= scale/2）")
     parser.add_argument('--position_embedding', default='sine', type=str, choices=('sine', 'learned'),
                         help="Type of positional embedding to use on top of the image features")
 
@@ -100,6 +109,10 @@ def get_args_parser():
                         help='device to use for training / testing')
     parser.add_argument('--seed', default=42, type=int)
     parser.add_argument('--resume', default='', help='resume from checkpoint')
+    parser.add_argument('--pretrain_weights', default='', type=str,
+                        help='Path to pretrained checkpoint (base-DETR or DAB-DETR). '
+                             'Loaded with strict=False: 相容 key 自動載入，新增 key 隨機初始化，'
+                             '多餘 key 忽略。 --resume 仍可疊加使用（繼續訓練優先）。')
     parser.add_argument('--start_epoch', default=0, type=int, metavar='N',
                         help='start epoch')
     parser.add_argument('--eval', action='store_true')
@@ -177,6 +190,15 @@ def main(args):
     if args.frozen_weights is not None:
         checkpoint = torch.load(args.frozen_weights, map_location='cpu', weights_only=False)
         model_without_ddp.detr.load_state_dict(checkpoint['model'])
+
+    # ── Soft pretrain loading（base-DETR / DAB-DETR → DINO，strict=False）────
+    if args.pretrain_weights and not args.resume:
+        ckpt = torch.load(args.pretrain_weights, map_location='cpu', weights_only=False)
+        state = ckpt.get('model', ckpt)   # 相容 {'model': ...} 或裸 state_dict
+        missing, unexpected = model_without_ddp.load_state_dict(state, strict=False)
+        print(f'[pretrain] Loaded from {args.pretrain_weights}')
+        print(f'[pretrain] missing  ({len(missing)}): {missing}')
+        print(f'[pretrain] unexpected ({len(unexpected)}): {unexpected}')
 
     output_dir = Path(args.output_dir)
 

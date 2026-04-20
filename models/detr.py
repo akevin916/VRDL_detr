@@ -12,16 +12,18 @@ from util.misc import (NestedTensor, nested_tensor_from_tensor_list,
                        is_dist_avail_and_initialized)
 
 from .backbone import build_backbone
+from .cdn import compute_cdn_loss, prepare_cdn_queries
 from .matcher import build_matcher
 from .segmentation import (DETRsegm, PostProcessPanoptic, PostProcessSegm,
                            dice_loss, sigmoid_focal_loss)
-from .transformer import build_transformer
+from .transformer import build_transformer, inverse_sigmoid
 
 
 class DETR(nn.Module):
     """ This is the DETR module that performs object detection """
     def __init__(self, backbone, transformer, num_classes, num_queries, aux_loss=False,
-                 use_dab=False):
+                 use_dab=False, use_dino=False,
+                 cdn_groups=1, cdn_label_noise=0.5, cdn_box_noise=1.0):
         """ Initializes the model.
         Parameters:
             backbone: torch module of the backbone to be used. See backbone.py
@@ -31,41 +33,55 @@ class DETR(nn.Module):
                          DETR can detect in a single image. For COCO, we recommend 100 queries.
             aux_loss: True if auxiliary decoding losses (loss at each decoder layer) are to be used.
             use_dab: True to use DAB-DETR (query_anchor + query_content + iterative refinement).
+            use_dino: True to use DINO (CDN + Mixed Query Selection + Look Forward Twice).
+                      Implies use_dab=True.
+            cdn_groups: number of CDN denoising groups (DINO training).
+            cdn_label_noise: fraction of GT labels randomly flipped in positive CDN queries.
+            cdn_box_noise: noise scale for CDN box perturbation.
         """
         super().__init__()
+        if use_dino:
+            use_dab = True   # DINO requires DAB-style anchor queries
         self.num_queries = num_queries
+        self.num_classes = num_classes
         self.transformer = transformer
         hidden_dim = transformer.d_model
         self.class_embed = nn.Linear(hidden_dim, num_classes + 1)
         self.bbox_embed = MLP(hidden_dim, hidden_dim, 4, 3)
-        self.use_dab = use_dab
+        self.use_dab  = use_dab
+        self.use_dino = use_dino
         if use_dab:
-            # DAB-DETR: 分離位置與內容 embedding
+            # DAB-DETR / DINO: 分離位置與內容 embedding
             self.query_anchor  = nn.Embedding(num_queries, 4)          # pre-sigmoid anchor
             self.query_content = nn.Embedding(num_queries, hidden_dim)  # content prior
-            # 把 bbox_embed 暴露給 decoder 做迭代 refinement
+            # 把 bbox_embed 暴露給 decoder 做迭代 refinement (DAB / LFT)
             self.transformer.decoder.bbox_embed = self.bbox_embed
         else:
             # 原始 DETR: 單一 query embedding
             self.query_embed = nn.Embedding(num_queries, hidden_dim)
+        if use_dino:
+            # DINO Two-Stage (Mixed Query Selection): encoder proposal heads
+            self.enc_class_embed = nn.Linear(hidden_dim, num_classes + 1)
+            self.enc_bbox_embed  = MLP(hidden_dim, hidden_dim, 4, 3)
+            # CDN hyperparameters
+            self.cdn_groups      = cdn_groups
+            self.cdn_label_noise = cdn_label_noise
+            self.cdn_box_noise   = cdn_box_noise
         self.input_proj = nn.Conv2d(backbone.num_channels, hidden_dim, kernel_size=1)
         self.backbone = backbone
         self.aux_loss = aux_loss
 
-    def forward(self, samples: NestedTensor):
-        """ The forward expects a NestedTensor, which consists of:
-               - samples.tensor: batched images, of shape [batch_size x 3 x H x W]
-               - samples.mask: a binary mask of shape [batch_size x H x W], containing 1 on padded pixels
+    def forward(self, samples: NestedTensor, targets=None):
+        """Forward pass, supports standard DETR / DAB-DETR / DINO modes.
 
-            It returns a dict with the following elements:
-               - "pred_logits": the classification logits (including no-object) for all queries.
-                                Shape= [batch_size x num_queries x (num_classes + 1)]
-               - "pred_boxes": The normalized boxes coordinates for all queries, represented as
-                               (center_x, center_y, height, width). These values are normalized in [0, 1],
-                               relative to the size of each individual image (disregarding possible padding).
-                               See PostProcess for information on how to retrieve the unnormalized bounding box.
-               - "aux_outputs": Optional, only returned when auxilary losses are activated. It is a list of
-                                dictionnaries containing the two above keys for each decoder layer.
+        Args:
+            samples : NestedTensor (images + padding mask)
+            targets : list of GT dicts (required only during DINO training)
+
+        Returns dict with keys:
+            pred_logits, pred_boxes, [aux_outputs],
+            [dn_outputs, dn_meta]  (DINO training),
+            [enc_outputs]          (DINO)
         """
         if isinstance(samples, (list, torch.Tensor)):
             samples = nested_tensor_from_tensor_list(samples)
@@ -73,6 +89,10 @@ class DETR(nn.Module):
 
         src, mask = features[-1].decompose()
         assert mask is not None
+
+        if self.use_dino:
+            return self._forward_dino(self.input_proj(src), mask, pos[-1], targets)
+
         if self.use_dab:
             hs = self.transformer(
                 self.input_proj(src), mask,
@@ -87,9 +107,83 @@ class DETR(nn.Module):
 
         outputs_class = self.class_embed(hs)
         outputs_coord = self.bbox_embed(hs).sigmoid()
-        out = {'pred_logits': outputs_class[-1], 'pred_boxes': outputs_coord[-1]}
+        out = {"pred_logits": outputs_class[-1], "pred_boxes": outputs_coord[-1]}
         if self.aux_loss:
-            out['aux_outputs'] = self._set_aux_loss(outputs_class, outputs_coord)
+            out["aux_outputs"] = self._set_aux_loss(outputs_class, outputs_coord)
+        return out
+
+    def _forward_dino(self, src, mask, pos_embed, targets=None):
+        """DINO forward: MQS + CDN + LFT."""
+        d = self.transformer.d_model
+
+        # Step 1: Encoder
+        memory, mask_f, pos_f, src_shape = self.transformer.encode(src, mask, pos_embed)
+
+        # Step 2: Mixed Query Selection
+        enc_mem    = memory.permute(1, 0, 2)             # (bs, hw, d)
+        enc_logits = self.enc_class_embed(enc_mem)       # (bs, hw, nc+1)
+        enc_boxes  = self.enc_bbox_embed(enc_mem).sigmoid()  # (bs, hw, 4)
+
+        topk_scores = enc_logits[..., :-1].max(-1).values
+        k = min(self.num_queries, topk_scores.shape[1])   # 確保 k ≤ 特徵圖 token 數
+        _, topk_idx = topk_scores.topk(k, dim=1)
+
+        idx_bb = topk_idx.unsqueeze(-1).expand(-1, -1, 4)
+        idx_d  = topk_idx.unsqueeze(-1).expand(-1, -1, d)
+        refpoints_mqs = enc_boxes.gather(1, idx_bb).detach()
+        tgt_mqs       = enc_mem.gather(1,   idx_d).detach()
+
+        # Step 3: CDN (training only)
+        cdn_meta = attn_mask = None
+        if self.training and targets is not None:
+            cdn_tgt, cdn_rp_presig, attn_mask, cdn_meta = prepare_cdn_queries(
+                targets, self.num_queries, self.num_classes, d,
+                self.cdn_groups, self.cdn_label_noise, self.cdn_box_noise
+            )
+            if cdn_meta is not None:
+                cdn_anchors = cdn_rp_presig.sigmoid()
+                combined_anchors = torch.cat([cdn_anchors, refpoints_mqs], dim=1)
+                combined_tgt     = torch.cat([cdn_tgt,     tgt_mqs],       dim=1)
+            else:
+                combined_anchors = refpoints_mqs
+                combined_tgt     = tgt_mqs
+        else:
+            combined_anchors = refpoints_mqs
+            combined_tgt     = tgt_mqs
+
+        # Step 4: Decode
+        tgt_dec    = combined_tgt.permute(1, 0, 2)
+        refpts_dec = combined_anchors.clamp(1e-4, 1 - 1e-4).permute(1, 0, 2)
+
+        hs, _ = self.transformer.decode(
+            tgt_dec, refpts_dec, memory, mask_f, pos_f, src_shape,
+            tgt_mask=attn_mask
+        )
+
+        # Step 5: Split CDN / detection outputs
+        if cdn_meta is not None:
+            cdn_size = cdn_meta["cdn_size"]
+            hs_dn  = hs[:, :, :cdn_size, :]
+            hs_det = hs[:, :, cdn_size:,  :]
+        else:
+            hs_det = hs
+
+        # Step 6: Predictions
+        out_class = self.class_embed(hs_det)
+        out_coord = self.bbox_embed(hs_det).sigmoid()
+        out = {"pred_logits": out_class[-1], "pred_boxes": out_coord[-1]}
+        if self.aux_loss:
+            out["aux_outputs"] = self._set_aux_loss(out_class, out_coord)
+
+        if cdn_meta is not None:
+            dn_class = self.class_embed(hs_dn)
+            dn_coord = self.bbox_embed(hs_dn).sigmoid()
+            out["dn_outputs"] = {"pred_logits": dn_class[-1], "pred_boxes": dn_coord[-1]}
+            if self.aux_loss:
+                out["dn_outputs"]["aux_outputs"] = self._set_aux_loss(dn_class, dn_coord)
+            out["dn_meta"] = cdn_meta
+
+        out["enc_outputs"] = {"pred_logits": enc_logits, "pred_boxes": enc_boxes}
         return out
 
     @torch.jit.unused
@@ -273,6 +367,18 @@ class SetCriterion(nn.Module):
                     l_dict = {k + f'_{i}': v for k, v in l_dict.items()}
                     losses.update(l_dict)
 
+        # Encoder proposal loss（DINO Two-Stage MQS）
+        if 'enc_outputs' in outputs:
+            enc_out     = outputs['enc_outputs']
+            enc_indices = self.matcher(enc_out, targets)
+            for loss in self.losses:
+                if loss == 'masks':
+                    continue
+                kwargs = {'log': False} if loss == 'labels' else {}
+                l_dict = self.get_loss(loss, enc_out, targets, enc_indices, num_boxes, **kwargs)
+                l_dict = {f'enc_{k}': v for k, v in l_dict.items()}
+                losses.update(l_dict)
+
         return losses
 
 
@@ -347,6 +453,7 @@ def build(args):
 
     transformer = build_transformer(args)
 
+    use_dino = getattr(args, 'use_dino', False)
     model = DETR(
         backbone,
         transformer,
@@ -354,6 +461,10 @@ def build(args):
         num_queries=args.num_queries,
         aux_loss=args.aux_loss,
         use_dab=getattr(args, 'use_dab', False),
+        use_dino=use_dino,
+        cdn_groups=getattr(args, 'cdn_groups', 1),
+        cdn_label_noise=getattr(args, 'cdn_label_noise', 0.5),
+        cdn_box_noise=getattr(args, 'cdn_box_noise', 1.0),
     )
     if args.masks:
         model = DETRsegm(model, freeze_detr=(args.frozen_weights is not None))
@@ -369,6 +480,20 @@ def build(args):
         for i in range(args.dec_layers - 1):
             aux_weight_dict.update({k + f'_{i}': v for k, v in weight_dict.items()})
         weight_dict.update(aux_weight_dict)
+
+    # DINO 額外損失權重：CDN 去噪損失 + encoder proposal 損失
+    if getattr(args, 'use_dino', False):
+        dn_wd = {'dn_loss_ce': 1, 'dn_loss_bbox': 1, 'dn_loss_giou': 1}
+        enc_wd = {'enc_loss_ce': 1,
+                  'enc_loss_bbox': args.bbox_loss_coef,
+                  'enc_loss_giou': args.giou_loss_coef}
+        weight_dict.update(dn_wd)
+        weight_dict.update(enc_wd)
+        if args.aux_loss:
+            for i in range(args.dec_layers - 1):
+                weight_dict.update({f'dn_loss_ce_{i}': 1,
+                                    f'dn_loss_bbox_{i}': 1,
+                                    f'dn_loss_giou_{i}': 1})
 
     losses = ['labels', 'boxes', 'cardinality']
     if args.masks:

@@ -78,37 +78,92 @@ class Transformer(nn.Module):
             if p.dim() > 1:
                 nn.init.xavier_uniform_(p)
 
-    def forward(self, src, mask, query_embed_or_anchor, pos_embed, query_content=None):
-        """共用入口。
+    def _flatten_src(self, src, mask, pos_embed):
+        """(bs,c,h,w) → (hw,bs,c) NLP convention。同時 flatten mask 和 pos_embed。"""
+        bs, c, h, w = src.shape
+        src_f   = src.flatten(2).permute(2, 0, 1)       # (hw, bs, c)
+        pos_f   = pos_embed.flatten(2).permute(2, 0, 1)  # (hw, bs, d)
+        mask_f  = mask.flatten(1)                         # (bs, hw)
+        return src_f, pos_f, mask_f, (bs, c, h, w)
+
+    def encode(self, src, mask, pos_embed):
+        """只執行 Encoder，回傳 encoder memory 及後續 decode 所需的 flat 張量。
+
+        Returns:
+            memory   : (hw, bs, d)
+            mask_f   : (bs, hw)
+            pos_f    : (hw, bs, d)
+            src_shape: (bs, c, h, w) 供 decode 重建空間形狀用
+        """
+        src_f, pos_f, mask_f, src_shape = self._flatten_src(src, mask, pos_embed)
+        memory = self.encoder(src_f, src_key_padding_mask=mask_f, pos=pos_f)
+        return memory, mask_f, pos_f, src_shape
+
+    def decode(self, tgt, refpoints_sigmoid, memory, mask_f, pos_f, src_shape,
+               tgt_mask=None):
+        """只執行 Decoder。
+
+        Args:
+            tgt               : (num_q, bs, d)
+            refpoints_sigmoid : (num_q, bs, 4)  值在 [0,1]（sigmoid 空間）
+            tgt_mask          : (total_q, total_q) bool，True = 阻擋（CDN 用）
+
+        Returns:
+            hs_T             : (layers, bs, num_q, d)
+            memory_spatial   : (bs, c, h, w)  供 segmentation 用
+        """
+        bs, c, h, w = src_shape
+        hs = self.decoder(tgt, memory, memory_key_padding_mask=mask_f,
+                          pos=pos_f, refpoints_sigmoid=refpoints_sigmoid,
+                          tgt_mask=tgt_mask)
+        return hs.transpose(1, 2), memory.permute(1, 2, 0).view(bs, c, h, w)
+
+    def forward(self, src, mask, query_embed_or_anchor, pos_embed,
+                query_content=None,
+                tgt_override=None, refpoints_presig_override=None,
+                tgt_mask=None):
+        """共用入口，支援標準 DETR / DAB-DETR / DINO 三種模式。
 
         原始 DETR (dab=False):
             query_embed_or_anchor : (num_q, d_model) — 學習的 query embedding
-        DAB-DETR (dab=True):
+        DAB-DETR / DINO (dab=True):
             query_embed_or_anchor : (num_q, 4)       — pre-sigmoid anchor (cx,cy,w,h)
             query_content         : (num_q, d_model) — 學習的 content embedding
+        DINO 專用覆寫（MQS + CDN）:
+            tgt_override          : (bs, num_q, d)   — 外部提供的 content（bs 維在前）
+            refpoints_presig_override: (bs, num_q, 4)— 外部提供的 anchor（pre-sigmoid）
+            tgt_mask              : (total_q, total_q) bool — CDN 注意力遮罩
         """
-        bs, c, h, w = src.shape
-        src      = src.flatten(2).permute(2, 0, 1)
-        pos_embed = pos_embed.flatten(2).permute(2, 0, 1)
-        mask     = mask.flatten(1)
-
-        memory = self.encoder(src, src_key_padding_mask=mask, pos=pos_embed)
+        memory, mask_f, pos_f, src_shape = self.encode(src, mask, pos_embed)
+        bs = src_shape[0]
 
         if self.dab:
-            num_q = query_embed_or_anchor.shape[0]
-            tgt = (query_content.unsqueeze(1).repeat(1, bs, 1)
-                   if query_content is not None
-                   else torch.zeros(num_q, bs, self.d_model, device=src.device))
-            refpoints = query_embed_or_anchor.sigmoid().unsqueeze(1).repeat(1, bs, 1)
-            hs = self.decoder(tgt, memory, memory_key_padding_mask=mask,
-                              pos=pos_embed, refpoints_sigmoid=refpoints)
+            nq = query_embed_or_anchor.shape[0]
+
+            # content (tgt)：外部覆寫 > query_content > 零向量
+            if tgt_override is not None:
+                tgt = tgt_override.permute(1, 0, 2)             # (num_q, bs, d)
+            elif query_content is not None:
+                tgt = query_content.unsqueeze(1).repeat(1, bs, 1)
+            else:
+                tgt = torch.zeros(nq, bs, self.d_model, device=memory.device)
+
+            # refpoints：外部覆寫 > learned anchor
+            if refpoints_presig_override is not None:
+                # pre-sigmoid → sigmoid
+                refpoints = refpoints_presig_override.permute(1, 0, 2).sigmoid()  # (num_q, bs, 4)
+            else:
+                refpoints = query_embed_or_anchor.sigmoid().unsqueeze(1).repeat(1, bs, 1)
+
+            return self.decode(tgt, refpoints, memory, mask_f, pos_f, src_shape, tgt_mask)
+
         else:
             query_embed = query_embed_or_anchor.unsqueeze(1).repeat(1, bs, 1)
             tgt = torch.zeros_like(query_embed)
-            hs = self.decoder(tgt, memory, memory_key_padding_mask=mask,
-                              pos=pos_embed, query_pos=query_embed)
-
-        return hs.transpose(1, 2), memory.permute(1, 2, 0).view(bs, c, h, w)
+            hs = self.decoder(tgt, memory, memory_key_padding_mask=mask_f,
+                              pos=pos_f, query_pos=query_embed)
+            bs_, c_, h_, w_ = src_shape
+            return hs.transpose(1, 2), memory.permute(1, 2, 0).view(bs_, c_, h_, w_)
 
 
 class TransformerEncoder(nn.Module):
