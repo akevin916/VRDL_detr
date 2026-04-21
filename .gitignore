@@ -18,3 +18,5 @@ not_tracked_dir/
 data/
 outputs/
 results/
+RT-DETR/data/
+RT-DETR/output/

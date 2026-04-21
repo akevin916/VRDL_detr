@@ -98,13 +98,24 @@ def load_model(checkpoint_path: str, device: torch.device):
     # checkpoint 裡存有訓練時的 args
     train_args = ckpt['args']
 
-    # 舊 checkpoint（flag 加入前訓練的）沒有 use_dab 欄位
+    # 舊 checkpoint（flag 加入前訓練的）沒有 use_dab / use_dino 欄位
     # → 從 state_dict key 自動判斷架構，避免手動指定
     state_keys = set(ckpt['model'].keys())
-    if 'query_anchor.weight' in state_keys:
-        train_args.use_dab = True
+    if 'enc_class_embed.weight' in state_keys:
+        train_args.use_dino = True
+        train_args.use_dab  = True   # DINO 包含 DAB
+    elif 'query_anchor.weight' in state_keys:
+        train_args.use_dino = False
+        train_args.use_dab  = True
     else:
-        train_args.use_dab = False
+        train_args.use_dino = False
+        train_args.use_dab  = False
+
+    # 確保 DINO 所需的 CDN 參數存在（舊 checkpoint args 可能沒有）
+    if train_args.use_dino:
+        if not hasattr(train_args, 'cdn_groups'):      train_args.cdn_groups      = 1
+        if not hasattr(train_args, 'cdn_label_noise'): train_args.cdn_label_noise = 0.5
+        if not hasattr(train_args, 'cdn_box_noise'):   train_args.cdn_box_noise   = 1.0
 
     model, _, postprocessors = build_model(train_args)
     model.load_state_dict(ckpt['model'])
@@ -114,7 +125,8 @@ def load_model(checkpoint_path: str, device: torch.device):
     print(f"  epoch={ckpt.get('epoch', '?')}, "
           f"num_queries={train_args.num_queries}, "
           f"dilation={getattr(train_args, 'dilation', False)}, "
-          f"use_dab={train_args.use_dab}")
+          f"use_dab={train_args.use_dab}, "
+          f"use_dino={getattr(train_args, 'use_dino', False)}")
 
     return model, postprocessors
 
@@ -213,11 +225,18 @@ def run_inference(args):
     print(f"\n完成！共 {len(results)} 筆預測，已存至 {output_path}")
 
     # GT 評估：固定 score_thr，掃描 nms_iou
-    if args.gt_json:
+    if args.gt_json and args.sweep_nms_step > 0:
         eval_nms_sweep(raw_preds, args.gt_json, output_path.parent,
                        score_thr=args.score_thr,
                        step=args.sweep_nms_step,
                        highlight=args.nms_iou)
+
+    # GT 評估：固定 nms_iou，掃描 score_thr
+    if args.gt_json and args.sweep_score_step > 0:
+        eval_score_sweep(raw_preds, args.gt_json, output_path.parent,
+                         nms_iou=args.nms_iou,
+                         step=args.sweep_score_step,
+                         highlight=args.score_thr)
 
     # 視覺化：從所有圖片中隨機挑選 vis_n 張
     if args.vis_n > 0:
@@ -252,13 +271,24 @@ def eval_nms_sweep(raw_preds: dict, gt_json: str, out_dir: Path,
     print(f"\n=== NMS IoU Sweep（score_thr={score_thr:.2f}, GT: {gt_json}）===")
     coco_gt = COCO(gt_json)
 
+    # 只保留 GT 中存在的 image_id（test set 與 val GT 不匹配時自動過濾）
+    gt_img_ids = set(coco_gt.getImgIds())
+    raw_preds_eval = {k: v for k, v in raw_preds.items() if k in gt_img_ids}
+    if not raw_preds_eval:
+        print("  → 預測的 image_id 與 GT JSON 無交集，跳過 NMS sweep。")
+        print("  提示：NMS sweep 需對 val set 推理（--test_dir 改為 val 資料夾）")
+        return
+    if len(raw_preds_eval) < len(raw_preds):
+        print(f"  → 共 {len(raw_preds)} 張預測，其中 {len(raw_preds_eval)} 張在 GT 中，"
+              f"僅用這些評估。")
+
     # 加入 0（不做 NMS）作為對照
     nms_iou_list = [0.0] + [round(t, 2) for t in np.arange(step, 1.0 + step / 2, step)]
     rows = []
 
     for niou in nms_iou_list:
         dt_list = []
-        for image_id, pred in raw_preds.items():
+        for image_id, pred in raw_preds_eval.items():
             scores = torch.tensor(pred['scores'])
             labels = torch.tensor(pred['labels'])
             boxes_xyxy = torch.tensor(pred['boxes_xyxy'])
@@ -336,6 +366,104 @@ def eval_nms_sweep(raw_preds: dict, gt_json: str, out_dir: Path,
 
 
 # --------------------------------------------------------------------------- #
+# Score threshold sweep（固定 nms_iou，掃描 score_thr）
+# --------------------------------------------------------------------------- #
+def eval_score_sweep(raw_preds: dict, gt_json: str, out_dir: Path,
+                    nms_iou: float = 0.5, step: float = 0.05, highlight: float = 0.05):
+    """固定 nms_iou，掃描不同 score_thr，找最佳信心門檻。"""
+    from pycocotools.coco import COCO
+    from pycocotools.cocoeval import COCOeval
+    import contextlib, os
+
+    print(f"\n=== Score Threshold Sweep（nms_iou={nms_iou:.2f}, GT: {gt_json}）===")
+    coco_gt = COCO(gt_json)
+
+    gt_img_ids = set(coco_gt.getImgIds())
+    raw_preds_eval = {k: v for k, v in raw_preds.items() if k in gt_img_ids}
+    if not raw_preds_eval:
+        print("  → 預測的 image_id 與 GT JSON 無交集，跳過 score sweep。")
+        return
+    if len(raw_preds_eval) < len(raw_preds):
+        print(f"  → 共 {len(raw_preds)} 張預測，其中 {len(raw_preds_eval)} 張在 GT 中。")
+
+    thr_list = [round(t, 3) for t in np.arange(step, 1.0, step)]
+    rows = []
+
+    for thr in thr_list:
+        dt_list = []
+        for image_id, pred in raw_preds_eval.items():
+            scores     = torch.tensor(pred['scores'])
+            labels     = torch.tensor(pred['labels'])
+            boxes_xyxy = torch.tensor(pred['boxes_xyxy'])
+            boxes_xywh = torch.tensor(pred['boxes_xywh'])
+
+            keep = scores >= thr
+            scores     = scores[keep]
+            labels     = labels[keep]
+            boxes_xyxy = boxes_xyxy[keep]
+            boxes_xywh = boxes_xywh[keep]
+
+            if nms_iou > 0 and len(boxes_xyxy) > 0:
+                keep_nms   = apply_nms(scores, labels, boxes_xyxy, nms_iou)
+                scores     = scores[keep_nms]
+                labels     = labels[keep_nms]
+                boxes_xywh = boxes_xywh[keep_nms]
+
+            for s, l, b in zip(scores.tolist(), labels.tolist(), boxes_xywh.tolist()):
+                dt_list.append({
+                    'image_id':    image_id,
+                    'category_id': l,
+                    'bbox':        b,
+                    'score':       s,
+                })
+
+        if not dt_list:
+            rows.append((thr, 0, 0.0, 0.0, 0.0))
+            continue
+
+        with open(os.devnull, 'w') as devnull:
+            with contextlib.redirect_stdout(devnull):
+                coco_dt = coco_gt.loadRes(dt_list)
+                ev = COCOeval(coco_gt, coco_dt, 'bbox')
+                ev.evaluate()
+                ev.accumulate()
+                ev.summarize()
+
+        stats = ev.stats
+        rows.append((thr, len(dt_list), float(stats[0]), float(stats[1]), float(stats[2])))
+
+    header = f"{'score_thr':>10}  {'#preds':>7}  {'mAP':>7}  {'mAP50':>7}  {'mAP75':>7}"
+    print(header)
+    print('-' * len(header))
+    best_idx = int(np.argmax([r[2] for r in rows]))
+    for i, (thr, n, mAP, mAP50, mAP75) in enumerate(rows):
+        mark = ' ★' if abs(thr - highlight) < step / 2 else ('  *best*' if i == best_idx else '')
+        print(f"{thr:>10.3f}  {n:>7d}  {mAP:>7.4f}  {mAP50:>7.4f}  {mAP75:>7.4f}{mark}")
+    best = rows[best_idx]
+    print(f"\n最佳 score_thr: {best[0]:.3f}  →  mAP={best[2]:.4f}, mAP50={best[3]:.4f}")
+
+    out_dir.mkdir(parents=True, exist_ok=True)
+    save_path = out_dir / 'score_curve.png'
+    fig, ax = plt.subplots(figsize=(8, 4))
+    thrs   = [r[0] for r in rows]
+    mAPs   = [r[2] for r in rows]
+    mAP50s = [r[3] for r in rows]
+    ax.plot(thrs, mAPs,   marker='o', label='mAP')
+    ax.plot(thrs, mAP50s, marker='s', label='mAP50')
+    ax.axvline(x=highlight, color='gray', linestyle='--', alpha=0.6, label=f'score_thr={highlight}')
+    ax.axvline(x=best[0],   color='red',  linestyle=':',  alpha=0.8, label=f'best={best[0]}')
+    ax.set_xlabel('score_thr')
+    ax.set_ylabel('mAP')
+    ax.set_title(f'Score Threshold vs mAP  (nms_iou={nms_iou:.2f})')
+    ax.legend()
+    ax.grid(True, alpha=0.3)
+    plt.tight_layout()
+    plt.savefig(save_path, dpi=150)
+    plt.close(fig)
+    print(f"曲線圖已存至 {save_path}")
+
+
+# --------------------------------------------------------------------------- #
 # 視覺化單張圖片
 # --------------------------------------------------------------------------- #
 def visualize(pil_img, scores, labels, boxes_xyxy, save_path):
@@ -380,7 +508,9 @@ def get_args_parser():
                         help='GT 標注 JSON（e.g. data/nycu-hw2-data/valid.json）；'
                              '提供後自動掃描 nms_iou 並存曲線圖')
     parser.add_argument('--sweep_nms_step', default=0.05, type=float,
-                        help='nms_iou 掃描間距（預設 0.05）')
+                        help='nms_iou 掃描間距（預設 0.05，設為 0 可跳過 nms sweep）')
+    parser.add_argument('--sweep_score_step', default=0.0, type=float,
+                        help='score_thr 掃描間距（預設 0 = 不掃描；建議 0.05）')
     parser.add_argument('--nms_iou', default=0.5, type=float,
                         help='NMS IoU 門檻（0 = 不做 NMS，預設 0.5）')
     parser.add_argument('--score_thr', default=0.05, type=float,
